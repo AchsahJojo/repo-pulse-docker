@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Repo Pulse</title>
+</head>
+<body>
+  <h1>Repo Pulse</h1>
+  <button id="connect">Connect GitHub</button>
+  <p id="status"></p>
+  <ul id="repos"></ul>
+
+  <script type="module">
+    import Nango from "https://esm.sh/@nangohq/frontend";
+
+    // Point at your local Docker Nango (not cloud)
+    const NANGO_API = "http://localhost:3003";
+    const NANGO_CONNECT_UI = "http://localhost:3009";
+
+    const status = document.getElementById("status");
+    const reposEl = document.getElementById("repos");
+
+    async function loadRepos(connectionId) {
+      status.textContent = `Loading repos for connection ${connectionId}...`;
+      const res = await fetch(`/api/repos?connection_id=${encodeURIComponent(connectionId)}`);
+      if (!res.ok) {
+        const err = await res.text();
+        status.textContent = `Failed to load repos: ${err}`;
+        return;
+      }
+      const repos = await res.json();
+      reposEl.innerHTML = repos
+        .map((r) => `<li><a href="${r.url}" target="_blank">${r.name}</a> ⭐ ${r.stars}</li>`)
+        .join("");
+      status.textContent = `Connected via local Nango (${connectionId})`;
+    }
+
+    document.getElementById("connect").onclick = async () => {
+      status.textContent = "Opening Nango Connect...";
+      reposEl.innerHTML = "";
+
+      try {
+        // 1) Ask our Flask backend for a short-lived Connect session token
+        const sessionRes = await fetch("/api/session", { method: "POST" });
+        const sessionBody = await sessionRes.json();
+        if (!sessionRes.ok) {
+          const hint = sessionBody.hint ? `\n${sessionBody.hint}` : "";
+          throw new Error(`${sessionBody.error || "session failed"}: ${sessionBody.detail || ""}${hint}`);
+        }
+        const { token } = sessionBody;
+
+        // 2) Open Connect UI against local Docker (apiURL is required for self-host)
+        const nango = new Nango({ host: NANGO_API });
+        nango.openConnectUI({
+          sessionToken: token,
+          baseURL: NANGO_CONNECT_UI,
+          apiURL: NANGO_API,
+          onEvent: (event) => {
+            if (event.type === "connect") {
+              const connectionId = event.payload.connectionId;
+              loadRepos(connectionId);
+            } else if (event.type === "close") {
+              if (!status.textContent.startsWith("Connected")) {
+                status.textContent = "Connect closed — authorize GitHub to continue.";
+              }
+            } else if (event.type === "error") {
+              status.textContent = `Auth error: ${event.payload.errorType} — ${event.payload.errorMessage}`;
+            }
+          },
+        });
+      } catch (err) {
+        console.error(err);
+        status.textContent = `Could not start Connect: ${err.message}`;
+      }
+    };
+  </script>
+</body>
+</html>
