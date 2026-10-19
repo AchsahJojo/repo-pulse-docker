@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    container_name: repo-pulse-app
+    env_file: .env
+    environment:
+      NANGO_URL: http://host.docker.internal:3003
+    ports:
+      - "5002:5002"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
