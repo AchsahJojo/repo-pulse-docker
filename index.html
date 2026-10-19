@@ -5,9 +5,21 @@
 </head>
 <body>
   <h1>Repo Pulse</h1>
-  <button id="connect">Connect GitHub</button>
+  <button id="connect-github">Connect GitHub</button>
+  <button id="connect-okta">Connect to Okta</button>
   <p id="status"></p>
   <ul id="repos"></ul>
+  <table id="okta-users" hidden>
+    <thead>
+      <tr>
+        <th>First name</th>
+        <th>Last name</th>
+        <th>Email</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 
   <script type="module">
     import Nango from "https://esm.sh/@nangohq/frontend";
@@ -18,8 +30,12 @@
 
     const status = document.getElementById("status");
     const reposEl = document.getElementById("repos");
+    const oktaTable = document.getElementById("okta-users");
+    const oktaBody = oktaTable.querySelector("tbody");
 
     async function loadRepos(connectionId) {
+      oktaTable.hidden = true;
+      oktaBody.innerHTML = "";
       status.textContent = `Loading repos for connection ${connectionId}...`;
       const res = await fetch(`/api/repos?connection_id=${encodeURIComponent(connectionId)}`);
       if (!res.ok) {
@@ -31,16 +47,52 @@
       reposEl.innerHTML = repos
         .map((r) => `<li><a href="${r.url}" target="_blank">${r.name}</a> ⭐ ${r.stars}</li>`)
         .join("");
-      status.textContent = `Connected via local Nango (${connectionId})`;
+      status.textContent = `Connected to GitHub via local Nango (${connectionId})`;
     }
 
-    document.getElementById("connect").onclick = async () => {
-      status.textContent = "Opening Nango Connect...";
+    async function loadOktaUsers(connectionId) {
       reposEl.innerHTML = "";
+      status.textContent = `Loading Okta users for connection ${connectionId}...`;
+      const res = await fetch(`/api/okta/users?connection_id=${encodeURIComponent(connectionId)}`);
+      if (!res.ok) {
+        const err = await res.text();
+        status.textContent = `Failed to load Okta users: ${err}`;
+        return;
+      }
+      const users = await res.json();
+      oktaBody.innerHTML = users
+        .map(
+          (u) =>
+            `<tr>
+              <td>${u.firstName ?? ""}</td>
+              <td>${u.lastName ?? ""}</td>
+              <td>${u.email ?? ""}</td>
+              <td>${u.status ?? ""}</td>
+            </tr>`
+        )
+        .join("");
+      oktaTable.hidden = false;
+      status.textContent = `Connected to Okta via local Nango (${connectionId}) — ${users.length} user(s)`;
+    }
+
+    async function openConnect(integration, onConnected) {
+      status.textContent = `Opening Nango Connect for ${integration}...`;
+      if (integration === "github") {
+        reposEl.innerHTML = "";
+        oktaTable.hidden = true;
+        oktaBody.innerHTML = "";
+      } else {
+        reposEl.innerHTML = "";
+        oktaBody.innerHTML = "";
+        oktaTable.hidden = true;
+      }
 
       try {
-        // 1) Ask our Flask backend for a short-lived Connect session token
-        const sessionRes = await fetch("/api/session", { method: "POST" });
+        const sessionRes = await fetch("/api/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ integration }),
+        });
         const sessionBody = await sessionRes.json();
         if (!sessionRes.ok) {
           const hint = sessionBody.hint ? `\n${sessionBody.hint}` : "";
@@ -48,7 +100,6 @@
         }
         const { token } = sessionBody;
 
-        // 2) Open Connect UI against local Docker (apiURL is required for self-host)
         const nango = new Nango({ host: NANGO_API });
         nango.openConnectUI({
           sessionToken: token,
@@ -56,11 +107,10 @@
           apiURL: NANGO_API,
           onEvent: (event) => {
             if (event.type === "connect") {
-              const connectionId = event.payload.connectionId;
-              loadRepos(connectionId);
+              onConnected(event.payload.connectionId);
             } else if (event.type === "close") {
               if (!status.textContent.startsWith("Connected")) {
-                status.textContent = "Connect closed — authorize GitHub to continue.";
+                status.textContent = `Connect closed — authorize ${integration} to continue.`;
               }
             } else if (event.type === "error") {
               status.textContent = `Auth error: ${event.payload.errorType} — ${event.payload.errorMessage}`;
@@ -71,7 +121,13 @@
         console.error(err);
         status.textContent = `Could not start Connect: ${err.message}`;
       }
-    };
+    }
+
+    document.getElementById("connect-github").onclick = () =>
+      openConnect("github", loadRepos);
+
+    document.getElementById("connect-okta").onclick = () =>
+      openConnect("okta", loadOktaUsers);
   </script>
 </body>
 </html>
