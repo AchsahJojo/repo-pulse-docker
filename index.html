@@ -1,91 +1,252 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Repo Pulse</title>
+  <title>Nango Demos</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    section { margin: 2rem 0; padding-top: 1rem; border-top: 1px solid #ddd; }
+    section:first-of-type { border-top: none; }
+    h1, h2 { margin-bottom: 0.5rem; }
+    label { display: block; margin: 0.4rem 0; }
+    input { margin-left: 0.5rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: 0.75rem; }
+    th, td { border: 1px solid #ccc; padding: 0.35rem 0.5rem; text-align: left; }
+    .muted { color: #555; font-size: 0.9rem; }
+    #add-user-form[hidden], #okta-users[hidden], #requests-wrap[hidden] { display: none; }
+  </style>
 </head>
 <body>
-  <h1>Repo Pulse</h1>
-  <button id="connect-github">Connect GitHub</button>
-  <button id="connect-okta">Connect to Okta</button>
+  <h1>Nango Demos</h1>
+  <p class="muted">Local Nango Connect demos for GitHub, Okta, and Slack-approved Okta user creation.</p>
   <p id="status"></p>
-  <ul id="repos"></ul>
-  <table id="okta-users" hidden>
-    <thead>
-      <tr>
-        <th>First name</th>
-        <th>Last name</th>
-        <th>Email</th>
-        <th>Status</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
+
+  <section id="github-section">
+    <h2>GitHub</h2>
+    <button id="connect-github">Connect GitHub</button>
+    <ul id="repos"></ul>
+  </section>
+
+  <section id="okta-section">
+    <h2>Okta</h2>
+    <button id="connect-okta">Connect to Okta</button>
+    <button id="refresh-okta-users" type="button" hidden>Refresh users</button>
+    <p class="muted">Approved users are created with activate=false (Okta status STAGED) — provisioned, not signed in yet.</p>
+    <table id="okta-users" hidden>
+      <thead>
+        <tr>
+          <th>First name</th>
+          <th>Last name</th>
+          <th>Email</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <form id="add-user-form" hidden>
+      <h3>Request new Okta user</h3>
+      <p class="muted">Requires Slack connected. Sends an Approve/Deny message to #approvals.</p>
+      <label>First name <input id="first-name" name="firstName" required /></label>
+      <label>Last name <input id="last-name" name="lastName" required /></label>
+      <label>Email <input id="email" name="email" type="email" required /></label>
+      <button type="submit">Request user</button>
+    </form>
+
+    <div id="requests-wrap" hidden>
+      <h3>User requests</h3>
+      <ul id="requests-list"></ul>
+    </div>
+  </section>
+
+  <section id="slack-section">
+    <h2>Slack</h2>
+    <button id="connect-slack">Connect Slack</button>
+    <p id="slack-status" class="muted">Not connected.</p>
+  </section>
 
   <script type="module">
     import Nango from "https://esm.sh/@nangohq/frontend";
 
-    // Point at your local Docker Nango (not cloud)
     const NANGO_API = "http://localhost:3003";
     const NANGO_CONNECT_UI = "http://localhost:3009";
+    const LS_OKTA = "nango_okta_connection_id";
+    const LS_SLACK = "nango_slack_connection_id";
 
     const status = document.getElementById("status");
     const reposEl = document.getElementById("repos");
     const oktaTable = document.getElementById("okta-users");
     const oktaBody = oktaTable.querySelector("tbody");
+    const addUserForm = document.getElementById("add-user-form");
+    const requestsWrap = document.getElementById("requests-wrap");
+    const requestsList = document.getElementById("requests-list");
+    const slackStatus = document.getElementById("slack-status");
+    const refreshOktaBtn = document.getElementById("refresh-okta-users");
+
+    let oktaConnectionId = localStorage.getItem(LS_OKTA) || "";
+    let slackConnectionId = localStorage.getItem(LS_SLACK) || "";
+    let pollTimer = null;
+    let lastApprovedCount = 0;
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function clearUi() {
+      reposEl.innerHTML = "";
+      oktaBody.innerHTML = "";
+      oktaTable.hidden = true;
+    }
+
+    function updateAddUserVisibility() {
+      const ready = Boolean(oktaConnectionId && slackConnectionId);
+      addUserForm.hidden = !ready;
+      requestsWrap.hidden = !ready;
+      refreshOktaBtn.hidden = !oktaConnectionId;
+      slackStatus.textContent = slackConnectionId
+        ? `Connected (${slackConnectionId})`
+        : "Not connected.";
+      if (ready) {
+        startRequestPolling();
+        refreshRequests();
+      } else {
+        stopRequestPolling();
+      }
+    }
+
+    function clearStaleConnection(kind) {
+      if (kind === "okta") {
+        oktaConnectionId = "";
+        localStorage.removeItem(LS_OKTA);
+      } else if (kind === "slack") {
+        slackConnectionId = "";
+        localStorage.removeItem(LS_SLACK);
+      }
+      updateAddUserVisibility();
+    }
+
+    async function fetchJson(url, options) {
+      const res = await fetch(url, options);
+      if (res.status === 401 || res.status === 404) {
+        return { res, body: null, stale: true };
+      }
+      let body = null;
+      const text = await res.text();
+      try {
+        body = text ? JSON.parse(text) : null;
+      } catch {
+        body = text;
+      }
+      return { res, body, stale: false };
+    }
 
     async function loadRepos(connectionId) {
-      oktaTable.hidden = true;
-      oktaBody.innerHTML = "";
+      clearUi();
       status.textContent = `Loading repos for connection ${connectionId}...`;
-      const res = await fetch(`/api/repos?connection_id=${encodeURIComponent(connectionId)}`);
-      if (!res.ok) {
-        const err = await res.text();
-        status.textContent = `Failed to load repos: ${err}`;
+      const { res, body, stale } = await fetchJson(
+        `/api/repos?connection_id=${encodeURIComponent(connectionId)}`
+      );
+      if (stale) {
+        status.textContent = "GitHub connection expired — connect again.";
         return;
       }
-      const repos = await res.json();
-      reposEl.innerHTML = repos
-        .map((r) => `<li><a href="${r.url}" target="_blank">${r.name}</a> ⭐ ${r.stars}</li>`)
+      if (!res.ok) {
+        status.textContent = `Failed to load repos: ${typeof body === "string" ? body : JSON.stringify(body)}`;
+        return;
+      }
+      reposEl.innerHTML = body
+        .map(
+          (r) =>
+            `<li><a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">${escapeHtml(r.name)}</a> ⭐ ${escapeHtml(r.stars)}</li>`
+        )
         .join("");
       status.textContent = `Connected to GitHub via local Nango (${connectionId})`;
     }
 
     async function loadOktaUsers(connectionId) {
-      reposEl.innerHTML = "";
+      if (!connectionId) return;
+      oktaConnectionId = connectionId;
+      localStorage.setItem(LS_OKTA, connectionId);
+      updateAddUserVisibility();
+
       status.textContent = `Loading Okta users for connection ${connectionId}...`;
-      const res = await fetch(`/api/okta/users?connection_id=${encodeURIComponent(connectionId)}`);
-      if (!res.ok) {
-        const err = await res.text();
-        status.textContent = `Failed to load Okta users: ${err}`;
+      const { res, body, stale } = await fetchJson(
+        `/api/okta/users?connection_id=${encodeURIComponent(connectionId)}`
+      );
+      if (stale) {
+        clearStaleConnection("okta");
+        status.textContent = "Okta connection expired — connect again.";
         return;
       }
-      const users = await res.json();
-      oktaBody.innerHTML = users
+      if (!res.ok) {
+        status.textContent = `Failed to load Okta users: ${typeof body === "string" ? body : JSON.stringify(body)}`;
+        return;
+      }
+      oktaBody.innerHTML = body
         .map(
           (u) =>
             `<tr>
-              <td>${u.firstName ?? ""}</td>
-              <td>${u.lastName ?? ""}</td>
-              <td>${u.email ?? ""}</td>
-              <td>${u.status ?? ""}</td>
+              <td>${escapeHtml(u.firstName)}</td>
+              <td>${escapeHtml(u.lastName)}</td>
+              <td>${escapeHtml(u.email)}</td>
+              <td>${escapeHtml(u.status)}</td>
             </tr>`
         )
         .join("");
       oktaTable.hidden = false;
-      status.textContent = `Connected to Okta via local Nango (${connectionId}) — ${users.length} user(s)`;
+      status.textContent = `Connected to Okta via local Nango (${connectionId}) — ${body.length} user(s)`;
+    }
+
+    async function onSlackConnected(connectionId) {
+      slackConnectionId = connectionId;
+      localStorage.setItem(LS_SLACK, connectionId);
+      updateAddUserVisibility();
+      status.textContent = `Connected to Slack via local Nango (${connectionId})`;
+    }
+
+    async function refreshRequests() {
+      if (!oktaConnectionId || !slackConnectionId) return;
+      const { res, body } = await fetchJson("/api/okta/user-requests");
+      if (!res.ok || !Array.isArray(body)) return;
+
+      requestsList.innerHTML = body
+        .map((r) => {
+          const err = r.error ? ` — ${escapeHtml(r.error)}` : "";
+          const by = r.decided_by ? ` (by ${escapeHtml(r.decided_by)})` : "";
+          return `<li><code>${escapeHtml(r.request_id.slice(0, 8))}</code> ${escapeHtml(r.firstName)} ${escapeHtml(r.lastName)} &lt;${escapeHtml(r.email)}&gt; — <strong>${escapeHtml(r.status)}</strong>${by}${err}</li>`;
+        })
+        .join("");
+
+      const busy = body.some((r) => r.status === "pending" || r.status === "processing");
+      if (busy) startRequestPolling();
+      else stopRequestPolling();
+
+      const approvedCount = body.filter((r) => r.status === "approved").length;
+      if (approvedCount > lastApprovedCount && oktaConnectionId) {
+        loadOktaUsers(oktaConnectionId);
+      }
+      lastApprovedCount = approvedCount;
+    }
+
+    function startRequestPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(refreshRequests, 3000);
+    }
+
+    function stopRequestPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
     }
 
     async function openConnect(integration, onConnected) {
       status.textContent = `Opening Nango Connect for ${integration}...`;
-      if (integration === "github") {
-        reposEl.innerHTML = "";
-        oktaTable.hidden = true;
-        oktaBody.innerHTML = "";
-      } else {
-        reposEl.innerHTML = "";
-        oktaBody.innerHTML = "";
-        oktaTable.hidden = true;
-      }
+      clearUi();
 
       try {
         const sessionRes = await fetch("/api/session", {
@@ -128,6 +289,56 @@
 
     document.getElementById("connect-okta").onclick = () =>
       openConnect("okta", loadOktaUsers);
+
+    document.getElementById("connect-slack").onclick = () =>
+      openConnect("slack", onSlackConnected);
+
+    refreshOktaBtn.onclick = () => {
+      if (oktaConnectionId) loadOktaUsers(oktaConnectionId);
+    };
+
+    addUserForm.onsubmit = async (event) => {
+      event.preventDefault();
+      if (!oktaConnectionId || !slackConnectionId) {
+        status.textContent = "Connect Okta and Slack first.";
+        return;
+      }
+      const firstName = document.getElementById("first-name").value.trim();
+      const lastName = document.getElementById("last-name").value.trim();
+      const email = document.getElementById("email").value.trim();
+      status.textContent = "Submitting user request (pending Slack approval)...";
+
+      const { res, body, stale } = await fetchJson("/api/okta/user-requests", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          firstName,
+          lastName,
+          email,
+          okta_connection_id: oktaConnectionId,
+          slack_connection_id: slackConnectionId,
+        }),
+      });
+
+      if (stale) {
+        status.textContent = "Connection expired — reconnect Okta/Slack.";
+        return;
+      }
+      if (!res.ok) {
+        status.textContent = `Request failed: ${typeof body === "string" ? body : JSON.stringify(body)}`;
+        return;
+      }
+      status.textContent = `Pending Slack approval (${body.request_id}). Approve in #approvals.`;
+      addUserForm.reset();
+      startRequestPolling();
+      refreshRequests();
+    };
+
+    // Restore connections after refresh
+    updateAddUserVisibility();
+    if (oktaConnectionId) {
+      loadOktaUsers(oktaConnectionId);
+    }
   </script>
 </body>
 </html>
